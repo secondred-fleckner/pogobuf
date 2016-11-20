@@ -3,7 +3,7 @@
 const EventEmitter = require('events').EventEmitter,
     Long = require('long'),
     POGOProtos = require('node-pogo-protos'),
-    pogoSignature = require('node-pogo-signature'),
+    pogoSignature = require('../../node-pogo-signature'),
     Promise = require('bluebird'),
     request = require('request'),
     retry = require('bluebird-retry'),
@@ -60,7 +60,7 @@ function Client() {
      * Performs the initial API call.
      * @return {Promise} promise
      */
-    this.init = function() {
+    this.init = function(batch) {
         self.signatureBuilder = new pogoSignature.Builder({ protos: POGOProtos });
         self.lastMapObjectsCall = 0;
 
@@ -72,15 +72,19 @@ function Client() {
         */
         self.endpoint = INITIAL_ENDPOINT;
 
-        return self.batchStart()
-            .getPlayer()
-            .checkChallenge()
-            .getHatchedEggs()
-            .getInventory()
-            .checkAwardedBadges()
-            .downloadSettings()
-            .batchCall()
-            .then(self.processInitialData);
+        if (batch && typeof batch === 'function') {
+            return batch();
+        } else {
+            return self.batchStart()
+                .getPlayer()
+                .checkChallenge()
+                .getHatchedEggs()
+                .getInventory()
+                .checkAwardedBadges()
+                .downloadSettings()
+                .batchCall()
+                .then(self.processInitialData);
+        }
     };
 
     /**
