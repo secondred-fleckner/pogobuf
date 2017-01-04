@@ -77,6 +77,13 @@ function Client() {
 
         self.lastMapObjectsCall = 0;
 
+        this.version = this.version || '4500';
+        self.signatureBuilder = new pogoSignature.Builder({
+            protos: POGOProtos,
+            version: '0.' + ((+this.version) / 100).toFixed(0),
+        });
+        self.signatureBuilder.encryptAsync = Promise.promisify(self.signatureBuilder.encrypt, { context: self.signatureBuilder });
+
         /*
             The response to the first RPC call does not contain any response messages even though
             the envelope includes requests, technically it wouldn't be necessary to send the
@@ -1012,48 +1019,55 @@ function Client() {
      * @return {Promise} - A Promise that will be resolved with a RequestEnvelope instance
      */
     this.buildSignedEnvelope = function(requests, envelope) {
-        return new Promise((resolve, reject) => {
-            if (!envelope) {
-                try {
-                    envelope = self.buildEnvelope(requests);
-                } catch (e) {
-                    reject(new retry.StopError(e));
-                }
+        if (!envelope) {
+            try {
+                envelope = self.buildEnvelope(requests);
+            } catch (e) {
+                throw new retry.StopError(e);
             }
+        }
 
-            if (!envelope.auth_ticket) {
-                // Can't sign before we have received an auth ticket
-                resolve(envelope);
-                return;
+        if (!envelope.auth_ticket) {
+            // Can't sign before we have received an auth ticket
+            return Promise.resolve(envelope);
+        }
+
+        self.signatureBuilder.version = '0.' + ((+this.version) / 100).toFixed(0);
+        if (this.useHashSever) {
+            let hashKey = this.hashKey;
+            if (Array.isArray(hashKey)) {
+                this.hashKeyIdx = (this.hashKeyIdx + 1) % this.hashKey.length;
+                hashKey = this.hashKey[this.hashKeyIdx];
             }
+            self.signatureBuilder.useHashingServer(this.hashServerHost + this.hashVersion, hashKey);
+        }
+        self.signatureBuilder.setAuthTicket(envelope.auth_ticket);
+        if (typeof self.signatureInfo === 'function') {
+            self.signatureBuilder.setFields(self.signatureInfo(envelope));
+        } else if (self.signatureInfo) {
+            self.signatureBuilder.setFields(self.signatureInfo);
+        }
+        self.signatureBuilder.setLocation(envelope.latitude, envelope.longitude, envelope.accuracy);
 
-            this.version = this.version || '4500';
-            self.signatureBuilder = new pogoSignature.Builder({
-                protos: POGOProtos,
-                version: '0.' + ((+this.version) / 100).toFixed(0),
-            });
-            if (this.useHashSever) {
-                let hashKey = this.hashKey;
-                if (Array.isArray(hashKey)) {
-                    this.hashKeyIdx = (this.hashKeyIdx + 1) % this.hashKey.length;
-                    hashKey = this.hashKey[this.hashKeyIdx];
-                }
-                self.signatureBuilder.useHashingServer(this.hashServerHost + this.hashVersion, hashKey);
-            }
-            self.signatureBuilder.setAuthTicket(envelope.auth_ticket);
-            if (typeof self.signatureInfo === 'function') {
-                self.signatureBuilder.setFields(self.signatureInfo(envelope));
-            } else if (self.signatureInfo) {
-                self.signatureBuilder.setFields(self.signatureInfo);
-            }
-            self.signatureBuilder.setLocation(envelope.latitude, envelope.longitude, envelope.accuracy);
-
-            self.signatureBuilder.encrypt(envelope.requests, (err, sigEncrypted) => {
-                if (err) {
-                    reject(new retry.StopError(err));
-                    return;
-                }
-
+        return retry(() => self.signatureBuilder.encryptAsync(envelope.requests)
+                        .catch(err => {
+                            if (err.name === 'HashServerError') {
+                                if (err.message === 'Request limited') {
+                                    throw err;
+                                } else {
+                                    throw new retry.StopError(err);
+                                }
+                            } else {
+                                throw new retry.StopError(err);
+                            }
+                        }),
+            {
+                interval: 1000,
+                backoff: 2,
+                max_tries: 10,
+                args: envelope.requests,
+            })
+            .then(sigEncrypted => {
                 envelope.platform_requests.push(new POGOProtos.Networking.Envelopes.RequestEnvelope
                     .PlatformRequest({
                         type: POGOProtos.Networking.Platform.PlatformRequestType.SEND_ENCRYPTED_SIGNATURE,
@@ -1061,10 +1075,8 @@ function Client() {
                             encrypted_signature: sigEncrypted
                         }).encode()
                     }));
-
-                resolve(envelope);
+                return envelope;
             });
-        });
     };
 
     /**
