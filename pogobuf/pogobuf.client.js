@@ -939,6 +939,8 @@ function Client(options) {
                 return;
             }
 
+            self.signatureBuilder.version = '0.' + ((+this.version) / 100).toFixed(0);
+
             if (self.options.useHashingServer) {
                 let key = self.options.hashingKey;
                 if (Array.isArray(key)) {
@@ -951,13 +953,13 @@ function Client(options) {
 
             self.signatureBuilder.setAuthTicket(envelope.auth_ticket);
 
+            self.signatureBuilder.setLocation(envelope.latitude, envelope.longitude, envelope.accuracy);
+
             if (typeof self.options.signatureInfo === 'function') {
                 self.signatureBuilder.setFields(self.options.signatureInfo(envelope));
             } else if (self.options.signatureInfo) {
                 self.signatureBuilder.setFields(self.options.signatureInfo);
             }
-
-            self.signatureBuilder.setLocation(envelope.latitude, envelope.longitude, envelope.accuracy);
 
             self.signatureBuilder.encrypt(envelope.requests, (err, sigEncrypted) => {
                 if (err) {
