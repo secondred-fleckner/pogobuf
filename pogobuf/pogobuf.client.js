@@ -7,62 +7,109 @@ const EventEmitter = require('events').EventEmitter,
     Promise = require('bluebird'),
     request = require('request'),
     retry = require('bluebird-retry'),
-    Utils = require('./pogobuf.utils.js');
+    Utils = require('./pogobuf.utils.js'),
+    Lehmer = require('./lehmer.js');
+
+Promise.promisifyAll(request);
 
 const RequestType = POGOProtos.Networking.Requests.RequestType,
+    PlatformRequestType = POGOProtos.Networking.Platform.PlatformRequestType,
     RequestMessages = POGOProtos.Networking.Requests.Messages,
     Responses = POGOProtos.Networking.Responses;
 
 const INITIAL_ENDPOINT = 'https://pgorelease.nianticlabs.com/plfe/rpc';
-const DEFAULT_MAP_OBJECTS_DELAY = 5;
+
+// See pogobuf wiki for description of options
+const defaultOptions = {
+    authToken: '',
+    authType: 'ptc',
+    downloadSettings: true,
+    mapObjectsThrottling: true,
+    mapObjectsMinDelay: 5000,
+    proxy: null,
+    maxTries: 5,
+    automaticLongConversion: true,
+    includeRequestTypeInResponse: false,
+    version: 4500,
+    signatureInfo: {},
+    useHashingServer: false,
+    hashingServer: 'http://hashing.pogodev.io/',
+    hashingKey: null
+};
 
 /**
  * Pokémon Go RPC client.
  * @class Client
+ * @param {Object} [options] - Client options (see pogobuf wiki for documentation)
  * @memberof pogobuf
  */
-function Client() {
+function Client(options) {
     if (!(this instanceof Client)) {
-        return new Client();
+        return new Client(options);
     }
     const self = this;
 
-    /**
+    /*
      * PUBLIC METHODS
      */
 
-    /**
-     * Sets the authentication type and token (required before making API calls).
-     * @param {string} authType - Authentication provider type (ptc or google)
-     * @param {string} authToken - Authentication token received from authentication provider
-     */
-    this.setAuthInfo = function(authType, authToken) {
-        self.authType = authType;
-        self.authToken = authToken;
+     /**
+      * Sets the specified client option to the given value.
+      * Note that not all options support changes after client initialization.
+      * @param {string} option - Option name
+      * @param {string} value - Option value
+      */
+    this.setOption = function(option, value) {
+        self.options[option] = value;
     };
 
     /**
      * Sets the player's latitude and longitude.
      * Note that this does not actually update the player location on the server, it only sets
      * the location to be used in following API calls. To update the location on the server you
-     * probably want to call {@link #updatePlayer}.
-     * @param {number} latitude - The player's latitude
+     * probably want to call {@link #playerUpdate}.
+     * @param {number|object} latitude - The player's latitude, or an object with parameters
      * @param {number} longitude - The player's longitude
      * @param {number} [accuracy=0] - The location accuracy in m
+     * @param {number} [altitude=0] - The player's altitude
      */
-    this.setPosition = function(latitude, longitude, accuracy) {
+    this.setPosition = function(latitude, longitude, accuracy, altitude) {
+        if (typeof latitude === 'object') {
+            const pos = latitude;
+            latitude = pos.latitude;
+            longitude = pos.longitude;
+            accuracy = pos.accuracy;
+            altitude = pos.altitude;
+        }
         self.playerLatitude = latitude;
         self.playerLongitude = longitude;
         self.playerLocationAccuracy = accuracy || 0;
+        self.playerAltitude = altitude || 0;
     };
 
     /**
-     * Performs the initial API call.
+     * Performs client initialization and downloads needed settings from the API and hashing server.
+     * @param {boolean} [downloadSettings] - Deprecated, use downloadSettings option instead
      * @return {Promise} promise
      */
-    this.init = function(batch) {
-        self.signatureBuilder = new pogoSignature.Builder({ protos: POGOProtos });
+    this.init = function(downloadSettings) {
+        // For backwards compatibility only
+        if (typeof downloadSettings !== 'undefined') self.setOption('downloadSettings', downloadSettings);
+
         self.lastMapObjectsCall = 0;
+
+        // convert app version (5100) to client version (0.51)
+        let signatureVersion = '0.' + ((+self.options.version) / 100).toFixed(0);
+        if ((+self.options.version % 100) !== 0) {
+            signatureVersion += '.' + (+self.options.version % 100);
+        }
+
+        self.signatureBuilder = new pogoSignature.Builder({
+            protos: POGOProtos,
+            version: signatureVersion,
+        });
+        self.signatureBuilder.encryptAsync = Promise.promisify(self.signatureBuilder.encrypt,
+                                                                { context: self.signatureBuilder });
 
         /*
             The response to the first RPC call does not contain any response messages even though
@@ -72,19 +119,17 @@ function Client() {
         */
         self.endpoint = INITIAL_ENDPOINT;
 
-        if (batch && typeof batch === 'function') {
-            return batch();
-        } else {
-            return self.batchStart()
-                .getPlayer()
-                .checkChallenge()
-                .getHatchedEggs()
-                .getInventory()
-                .checkAwardedBadges()
-                .downloadSettings()
-                .batchCall()
-                .then(self.processInitialData);
+        let promise = Promise.resolve(true);
+
+        if (self.options.useHashingServer) {
+            promise = promise.then(self.initializeHashingServer);
         }
+
+        if (self.options.downloadSettings) {
+            promise = promise.then(() => self.downloadSettings()).then(self.processSettingsResponse);
+        }
+
+        return promise;
     };
 
     /**
@@ -111,79 +156,9 @@ function Client() {
      * @return {Promise}
      */
     this.batchCall = function() {
-        if (!self.batchRequests || !self.batchRequests.length) {
-            return Promise.resolve(false);
-        }
-
-        var p = self.callRPC(self.batchRequests);
-
+        var p = self.callRPC(self.batchRequests || []);
         self.batchClear();
         return p;
-    };
-
-    /**
-     * Sets the maximum times to try RPC calls until they succeed (default is 5 tries).
-     * Set to 1 to disable retry logic.
-     * @param {integer} maxTries
-     */
-    this.setMaxTries = function(maxTries) {
-        self.maxTries = maxTries;
-    };
-
-    /**
-     * Sets a proxy address to use for the HTTPS RPC requests.
-     * @param {string} proxy
-     */
-    this.setProxy = function(proxy) {
-        self.proxy = proxy;
-    };
-
-    /**
-     * Enables or disables the built-in throttling of getMapObjects() calls based on the
-     * minimum refresh setting received from the server. Enabled by default, disable if you
-     * want to manage your own throttling.
-     * @param {boolean} enable
-     */
-    this.setMapObjectsThrottlingEnabled = function(enable) {
-        self.mapObjectsThrottlingEnabled = enable;
-    };
-
-    /**
-     * Pass additional infos for the signature, like device_info.
-     * @param {object} infos
-     */
-    this.setSignatureInfo = function(infos) {
-        self.signatureInfo = infos;
-    };
-
-    /**
-     * Sets a callback to be called for any envelope or request just before it is sent to
-     * the server (mostly for debugging purposes).
-     * @deprecated Use the raw-request event instead
-     * @param {function} callback - function to call on requests
-     */
-    this.setRequestCallback = function(callback) {
-        self.on('raw-request', callback);
-    };
-
-    /**
-     * Sets a callback to be called for any envelope or response just after it has been
-     * received from the server (mostly for debugging purposes).
-     * @deprecated Use the raw-response event instead
-     * @param {function} callback - function to call on responses
-     */
-    this.setResponseCallback = function(callback) {
-        self.on('raw-response', callback);
-    };
-
-    /**
-     * Enables or disables automatic conversion of Long.js
-     * to primitive types in API response objects.
-     * @param {boolean} enable
-     */
-    this.setAutomaticLongConversionEnabled = function(enable) {
-        if (typeof enable !== 'boolean') return;
-        self.automaticLongConversionEnabled = enable;
     };
 
     /*
@@ -235,9 +210,14 @@ function Client() {
         });
     };
 
-    this.downloadItemTemplates = function() {
+    this.downloadItemTemplates = function(paginate, pageOffset, pageTimestamp) {
         return self.callOrChain({
             type: RequestType.DOWNLOAD_ITEM_TEMPLATES,
+            message: new RequestMessages.DownloadItemTemplatesMessage({
+                paginate: paginate,
+                page_offset: pageOffset,
+                page_timestamp: pageTimestamp
+            }),
             responseType: Responses.DownloadItemTemplatesResponse
         });
     };
@@ -362,11 +342,14 @@ function Client() {
         });
     };
 
-    this.releasePokemon = function(pokemonID) {
+    this.releasePokemon = function(pokemonIDs) {
+        if (!Array.isArray(pokemonIDs)) pokemonIDs = [pokemonIDs];
+
         return self.callOrChain({
             type: RequestType.RELEASE_POKEMON,
             message: new RequestMessages.ReleasePokemonMessage({
-                pokemon_id: pokemonID
+                pokemon_id: pokemonIDs.length === 1 ? pokemonIDs[0] : undefined,
+                pokemon_ids: pokemonIDs.length > 1 ? pokemonIDs : undefined
             }),
             responseType: Responses.ReleasePokemonResponse
         });
@@ -716,23 +699,6 @@ function Client() {
         });
     };
 
-    this.getSuggestedCodenames = function() {
-        return self.callOrChain({
-            type: RequestType.GET_SUGGESTED_CODENAMES,
-            responseType: Responses.GetSuggestedCodenamesResponse
-        });
-    };
-
-    this.checkCodenameAvailable = function(codename) {
-        return self.callOrChain({
-            type: RequestType.CHECK_CODENAME_AVAILABLE,
-            message: new RequestMessages.CheckCodenameAvailableMessage({
-                codename: codename
-            }),
-            responseType: Responses.CheckCodenameAvailableResponse
-        });
-    };
-
     this.claimCodename = function(codename) {
         return self.callOrChain({
             type: RequestType.CLAIM_CODENAME,
@@ -743,7 +709,7 @@ function Client() {
         });
     };
 
-    this.setAvatar = function(skin, hair, shirt, pants, hat, shoes, gender, eyes, backpack) {
+    this.setAvatar = function(skin, hair, shirt, pants, hat, shoes, avatar, eyes, backpack) {
         return self.callOrChain({
             type: RequestType.SET_AVATAR,
             message: new RequestMessages.SetAvatarMessage({
@@ -754,7 +720,7 @@ function Client() {
                     pants: pants,
                     hat: hat,
                     shoes: shoes,
-                    gender: gender,
+                    avatar: avatar,
                     eyes: eyes,
                     backpack: backpack
                 }
@@ -819,6 +785,30 @@ function Client() {
         });
     };
 
+    this.listAvatarCustomizations = function(avatarType, slots, filters, start, limit) {
+        return self.callOrChain({
+            type: RequestType.LIST_AVATAR_CUSTOMIZATIONS,
+            message: new RequestMessages.ListAvatarCustomizationsMessage({
+                avatar_type: avatarType,
+                slot: slots,
+                filters: filters,
+                start: start,
+                limit: limit
+            }),
+            responseType: Responses.ListAvatarCustomizationsResponse
+        });
+    };
+
+    this.setAvatarItemAsViewed = function(avatarTemplateIDs) {
+        return self.callOrChain({
+            type: RequestType.SET_AVATAR_ITEM_AS_VIEWED,
+            message: new RequestMessages.SetAvatarItemAsViewedMessage({
+                avatar_template_id: avatarTemplateIDs
+            }),
+            responseType: Responses.SetAvatarItemAsViewdResponse
+        });
+    };
+
     /*
      * INTERNAL STUFF
      */
@@ -832,12 +822,13 @@ function Client() {
         encoding: null
     });
 
-    this.maxTries = 5;
-    this.mapObjectsThrottlingEnabled = true;
-    this.mapObjectsMinDelay = DEFAULT_MAP_OBJECTS_DELAY * 1000;
-    this.automaticLongConversionEnabled = true;
-    this.rpcId = 0;
-    this.signatureInfo = {};
+    this.options = Object.assign({}, defaultOptions, options || {});
+    this.authTicket = null;
+    this.rpcId = 2;
+    this.lastHashingKeyIndex = 0;
+    this.firstGetMapObjects = true;
+    this.lehmer = new Lehmer(1);
+    this.ptr8 = '';
 
     /**
      * Executes a request and returns a Promise or, if we are in batch mode, adds it to the
@@ -856,19 +847,12 @@ function Client() {
     };
 
     /**
-     * Generates a random request ID
+     * Generates next rpc request id
      * @private
      * @return {Long}
      */
     this.getRequestID = function() {
-        var rand = 0x53B77E48;
-        if (self.rpcId === 0) {
-            self.rpcId = 1;
-        } else {
-            rand = Math.floor(Math.random() * Math.pow(2, 31));
-        }
-        self.rpcId++;
-        return new Long(self.rpcId, rand & 0xFFFFFFFF);
+        return new Long(self.rpcId++, this.lehmer.nextInt());
     };
 
     /**
@@ -889,21 +873,26 @@ function Client() {
         if (self.playerLocationAccuracy) {
             envelopeData.accuracy = self.playerLocationAccuracy;
         } else {
-            var values = [5, 5, 5, 5, 10, 10, 10, 30, 30, 50, 65];
+            const values = [5, 5, 5, 5, 10, 10, 10, 30, 30, 50, 65];
             values.unshift(Math.floor(Math.random() * (80 - 66)) + 66);
             envelopeData.accuracy = values[Math.floor(values.length * Math.random())];
         }
 
         if (self.authTicket) {
             envelopeData.auth_ticket = self.authTicket;
-        } else if (!self.authType || !self.authToken) {
+        } else if (!self.options.authType || !self.options.authToken) {
             throw Error('No auth info provided');
         } else {
+            let unknown2 = 0;
+            if (self.options.authType === 'ptc') {
+                const values = [2, 8, 21, 21, 21, 28, 37, 56, 59, 59, 59];
+                unknown2 = values[Math.floor(values.length * Math.random())];
+            }
             envelopeData.auth_info = {
-                provider: self.authType,
+                provider: self.options.authType,
                 token: {
-                    contents: self.authToken,
-                    unknown2: 59
+                    contents: self.options.authToken,
+                    unknown2: unknown2,
                 }
             };
         }
@@ -937,6 +926,37 @@ function Client() {
     };
 
     /**
+     * Add the mysterious platform_request type 8 on request
+     * @param {Object[]} requests - Array of requests to build
+     * @param {RequestEnvelope} [envelope] - Pre-built request envelope to modify
+     */
+    this.maybeAddPlatformRequest8 = function(requests, envelope) {
+        let addIt = false;
+        if ((requests.length === 1 && requests[0].type === RequestType.GET_PLAYER)) {
+            // always in firsdt get_player
+            addIt = true;
+        } else if (requests.some(r => r.type === RequestType.GET_MAP_OBJECTS)) {
+            if (this.firstGetMapObjects) {
+                // not on first gmo
+                this.firstGetMapObjects = false;
+            } else {
+                // on all others?
+                addIt = true;
+            }
+        }
+
+        if (addIt) {
+            envelope.platform_requests.push(new POGOProtos.Networking.Envelopes.RequestEnvelope
+                .PlatformRequest({
+                    type: POGOProtos.Networking.Platform.PlatformRequestType.UNKNOWN_PTR_8,
+                    request_message: new POGOProtos.Networking.Platform.Requests.UnknownPtr8Request({
+                        message: this.ptr8,
+                    }).encode()
+                }));
+        }
+    };
+
+    /**
      * Creates an RPC envelope with the given list of requests and adds the encrypted signature,
      * or adds the signature to an existing envelope.
      * @private
@@ -945,35 +965,60 @@ function Client() {
      * @return {Promise} - A Promise that will be resolved with a RequestEnvelope instance
      */
     this.buildSignedEnvelope = function(requests, envelope) {
-        return new Promise((resolve, reject) => {
-            if (!envelope) {
-                try {
-                    envelope = self.buildEnvelope(requests);
-                } catch (e) {
-                    reject(new retry.StopError(e));
-                }
+        if (!envelope) {
+            try {
+                envelope = self.buildEnvelope(requests);
+            } catch (e) {
+                throw new retry.StopError(e);
+            }
+        }
+
+        this.maybeAddPlatformRequest8(requests, envelope);
+
+        let authTicket = envelope.auth_ticket;
+        if (!authTicket) {
+            authTicket = envelope.auth_info;
+        }
+
+        if (!authTicket) {
+            // Can't sign before we have received an auth ticket
+            return Promise.resolve(envelope);
+        }
+
+        if (self.options.useHashingServer) {
+            let key = self.options.hashingKey;
+            if (Array.isArray(key)) {
+                key = key[self.lastHashingKeyIndex];
+                self.lastHashingKeyIndex = (self.lastHashingKeyIndex + 1) % self.options.hashingKey.length;
             }
 
-            if (!envelope.auth_ticket) {
-                // Can't sign before we have received an auth ticket
-                resolve(envelope);
-                return;
-            }
+            self.signatureBuilder.useHashingServer(self.options.hashingServer + self.hashingVersion, key);
+        }
 
-            self.signatureBuilder.setAuthTicket(envelope.auth_ticket);
-            self.signatureBuilder.setLocation(envelope.latitude, envelope.longitude, envelope.accuracy);
-            if (typeof self.signatureInfo === 'function') {
-                self.signatureBuilder.setFields(self.signatureInfo(envelope));
-            } else if (self.signatureInfo) {
-                self.signatureBuilder.setFields(self.signatureInfo);
-            }
+        self.signatureBuilder.setAuthTicket(authTicket);
+        self.signatureBuilder.setLocation(envelope.latitude, envelope.longitude, envelope.accuracy);
 
-            self.signatureBuilder.encrypt(envelope.requests, (err, sigEncrypted) => {
-                if (err) {
-                    reject(new retry.StopError(err));
-                    return;
-                }
+        if (typeof self.options.signatureInfo === 'function') {
+            self.signatureBuilder.setFields(self.options.signatureInfo(envelope));
+        } else if (self.options.signatureInfo) {
+            self.signatureBuilder.setFields(self.options.signatureInfo);
+        }
 
+        return retry(() => self.signatureBuilder.encryptAsync(envelope.requests)
+                        .catch(err => {
+                            if (err.name === 'HashServerError' && err.message === 'Request limited') {
+                                throw err;
+                            } else {
+                                throw new retry.StopError(err);
+                            }
+                        }),
+            {
+                interval: 1000,
+                backoff: 2,
+                max_tries: 10,
+                args: envelope.requests,
+            })
+            .then(sigEncrypted => {
                 envelope.platform_requests.push(new POGOProtos.Networking.Envelopes.RequestEnvelope
                     .PlatformRequest({
                         type: POGOProtos.Networking.Platform.PlatformRequestType.SEND_ENCRYPTED_SIGNATURE,
@@ -981,10 +1026,8 @@ function Client() {
                             encrypted_signature: sigEncrypted
                         }).encode()
                     }));
-
-                resolve(envelope);
+                return envelope;
             });
-        });
     };
 
     /**
@@ -1000,21 +1043,21 @@ function Client() {
         // since the last call has passed
         if (requests.some(r => r.type === RequestType.GET_MAP_OBJECTS)) {
             var now = new Date().getTime(),
-                delayNeeded = self.lastMapObjectsCall + self.mapObjectsMinDelay - now;
+                delayNeeded = self.lastMapObjectsCall + self.options.mapObjectsMinDelay - now;
 
-            if (delayNeeded > 0 && self.mapObjectsThrottlingEnabled) {
+            if (delayNeeded > 0 && self.options.mapObjectsThrottling) {
                 return Promise.delay(delayNeeded).then(() => self.callRPC(requests, envelope));
             }
 
             self.lastMapObjectsCall = now;
         }
 
-        if (self.maxTries <= 1) return self.tryCallRPC(requests, envelope);
+        if (self.options.maxTries <= 1) return self.tryCallRPC(requests, envelope);
 
         return retry(() => self.tryCallRPC(requests, envelope), {
             interval: 300,
             backoff: 2,
-            max_tries: self.maxTries
+            max_tries: self.options.maxTries
         });
     };
 
@@ -1032,7 +1075,7 @@ function Client() {
                 self.request({
                     method: 'POST',
                     url: self.endpoint,
-                    proxy: self.proxy,
+                    proxy: self.options.proxy,
                     body: signedEnvelope.toBuffer()
                 }, (err, response, body) => {
                     if (err) {
@@ -1100,7 +1143,25 @@ function Client() {
                             api_url: responseEnvelope.api_url
                         });
 
-                        resolve(self.callRPC(requests, envelope));
+                        signedEnvelope.platform_requests = [];
+                        resolve(self.callRPC(requests, signedEnvelope));
+                        return;
+                    }
+
+                    responseEnvelope.platform_returns.forEach(ptfm => {
+                        if (ptfm.type === PlatformRequestType.UNKNOWN_PTR_8) {
+                            const proto = POGOProtos.Networking.Platform.Responses.UnknownPtr8Response;
+                            const ptr8 = proto.decode(ptfm.response);
+                            this.ptr8 = ptr8.message;
+                        }
+                    });
+
+                    /* Throttling, retry same request later */
+                    if (responseEnvelope.status_code === 52) {
+                        signedEnvelope.platform_requests = [];
+                        Promise.delay(2000).then(() => {
+                            resolve(self.callRPC(requests, signedEnvelope));
+                        });
                         return;
                     }
 
@@ -1143,6 +1204,10 @@ function Client() {
                                 return;
                             }
 
+                            if (self.options.includeRequestTypeInResponse) {
+                                // eslint-disable-next-line no-underscore-dangle
+                                responseMessage._requestType = requests[i].type;
+                            }
                             responses.push(responseMessage);
                         }
                     }
@@ -1159,7 +1224,7 @@ function Client() {
                         }))
                     });
 
-                    if (self.automaticLongConversionEnabled) {
+                    if (self.options.automaticLongConversion) {
                         responses = Utils.convertLongs(responses);
                     }
 
@@ -1171,25 +1236,142 @@ function Client() {
     };
 
     /**
-     * Processes the data received from the initial API call during init().
+     * Processes the data received from the downloadSettings API call during init().
      * @private
-     * @param {Object[]} responses - Respones from API call
-     * @return {Object[]} respones - Unomdified responses (to send back to Promise)
+     * @param {Object} settingsResponse - Response from API call
+     * @return {Object} response - Unomdified response (to send back to Promise)
      */
-    this.processInitialData = function(responses) {
+    this.processSettingsResponse = function(settingsResponse) {
         // Extract the minimum delay of getMapObjects()
-        if (responses.length >= 5) {
-            var settingsResponse = responses[5];
-            if (!settingsResponse.error &&
-                settingsResponse.settings &&
-                settingsResponse.settings.map_settings &&
-                settingsResponse.settings.map_settings.get_map_objects_min_refresh_seconds
-            ) {
-                self.mapObjectsMinDelay =
-                    settingsResponse.settings.map_settings.get_map_objects_min_refresh_seconds * 1000;
-            }
+        if (settingsResponse &&
+            !settingsResponse.error &&
+            settingsResponse.settings &&
+            settingsResponse.settings.map_settings &&
+            settingsResponse.settings.map_settings.get_map_objects_min_refresh_seconds
+        ) {
+            self.setOption('mapObjectsMinDelay',
+                settingsResponse.settings.map_settings.get_map_objects_min_refresh_seconds * 1000);
         }
-        return responses;
+        return settingsResponse;
+    };
+
+    /**
+     * Makes an initial call to the hashing server to verify API version.
+     * @private
+     * @return {Promise}
+     */
+    this.initializeHashingServer = function() {
+        if (!self.options.hashingServer) throw new Error('Hashing server enabled without host');
+        if (!self.options.hashingKey) throw new Error('Hashing server enabled without key');
+
+        if (self.options.hashingServer.slice(-1) !== '/') {
+            self.setOption('hashingServer', self.options.hashingServer + '/');
+        }
+
+        return request.getAsync(self.options.hashingServer + 'api/hash/versions').then(response => {
+            const versions = JSON.parse(response.body);
+            if (!versions) throw new Error('Invalid initial response from hashing server');
+
+            let iosVersion = '1.' + ((+self.options.version - 3000) / 100).toFixed(0);
+            iosVersion += '.' + (+self.options.version % 100);
+            self.hashingVersion = versions[iosVersion];
+
+            if (!self.hashingVersion) {
+                throw new Error('Unsupported version for hashserver: ' + self.options.version + '/' + iosVersion);
+            }
+
+            return true;
+        });
+    };
+
+    /*
+     * DEPRECATED METHODS
+     */
+
+    /**
+     * Sets the authType and authToken options.
+     * @deprecated Use options object or setOption() instead
+     * @param {string} authType
+     * @param {string} authToken
+     */
+    this.setAuthInfo = function(authType, authToken) {
+        self.setOption('authType', authType);
+        self.setOption('authToken', authToken);
+    };
+
+    /**
+     * Sets the includeRequestTypeInResponse option.
+     * @deprecated Use options object or setOption() instead
+     * @param {bool} includeRequestTypeInResponse
+     */
+    this.setIncludeRequestTypeInResponse = function(includeRequestTypeInResponse) {
+        self.setOption('includeRequestTypeInResponse', includeRequestTypeInResponse);
+    };
+
+    /**
+     * Sets the maxTries option.
+     * @deprecated Use options object or setOption() instead
+     * @param {integer} maxTries
+     */
+    this.setMaxTries = function(maxTries) {
+        self.setOption('maxTries', maxTries);
+    };
+
+    /**
+     * Sets the proxy option.
+     * @deprecated Use options object or setOption() instead
+     * @param {string} proxy
+     */
+    this.setProxy = function(proxy) {
+        self.setOption('proxy', proxy);
+    };
+
+    /**
+     * Sets the mapObjectsThrottling option.
+     * @deprecated Use options object or setOption() instead
+     * @param {boolean} enable
+     */
+    this.setMapObjectsThrottlingEnabled = function(enable) {
+        self.setOption('mapObjectsThrottling', enable);
+    };
+
+    /**
+     * Sets the signatureInfo option.
+     * @deprecated Use options object or setOption() instead
+     * @param {object|function} info
+     */
+    this.setSignatureInfo = function(info) {
+        self.setOption('signatureInfo', info);
+    };
+
+    /**
+     * Sets a callback to be called for any envelope or request just before it is sent to
+     * the server (mostly for debugging purposes).
+     * @deprecated Use the raw-request event instead
+     * @param {function} callback - function to call on requests
+     */
+    this.setRequestCallback = function(callback) {
+        self.on('raw-request', callback);
+    };
+
+    /**
+     * Sets a callback to be called for any envelope or response just after it has been
+     * received from the server (mostly for debugging purposes).
+     * @deprecated Use the raw-response event instead
+     * @param {function} callback - function to call on responses
+     */
+    this.setResponseCallback = function(callback) {
+        self.on('raw-response', callback);
+    };
+
+    /**
+     * Sets the automaticLongConversion option.
+     * @deprecated Use options object or setOption() instead
+     * @param {boolean} enable
+     */
+    this.setAutomaticLongConversionEnabled = function(enable) {
+        if (typeof enable !== 'boolean') return;
+        self.setOption('automaticLongConversion', enable);
     };
 }
 

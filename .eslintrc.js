@@ -17,6 +17,7 @@ module.exports = {
         "indent": [2, 4, {
             "SwitchCase": 1
         }],
+        "linebreak-style": 0,
         "max-len": [1, {
             "tabWidth": 4,
             "code": 120,
@@ -29,6 +30,7 @@ module.exports = {
         "no-param-reassign": 0,
         "no-plusplus": 0,
         "no-prototype-builtins": 0,
+        "no-restricted-properties": 0,
         "no-restricted-syntax": [2,
             "LabeledStatement",
             "WithStatement"

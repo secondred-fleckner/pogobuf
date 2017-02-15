@@ -17,7 +17,7 @@ function PTCLogin() {
 
     self.request = request.defaults({
         headers: {
-            'User-Agent': 'Niantic App'
+            'User-Agent': 'pokemongo/1 CFNetwork/808.2.16 Darwin/16.3.0'
         },
         jar: request.jar()
     });
@@ -60,7 +60,14 @@ function PTCLogin() {
                     return;
                 }
 
-                var sessionResponse = JSON.parse(body);
+                var sessionResponse = null;
+                try {
+                    sessionResponse = JSON.parse(body);
+                } catch (e) {
+                    reject(Error('Unexpected response received from PTC login'));
+                    return;
+                }
+
                 if (!sessionResponse || !sessionResponse.lt && !sessionResponse.execution) {
                     reject(Error('No session data received from PTC login'));
                     return;
